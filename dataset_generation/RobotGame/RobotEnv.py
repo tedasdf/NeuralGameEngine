@@ -32,12 +32,6 @@ class RobotEnv(gym.Env):
         })
 
 
-        self.ser = serial.Serial(
-            port=serial_port,
-            baudrate=baud_rate,
-            timeout=timeout,
-        )
-
         self.current_sequence = None
         self.time_limit = time_limit
         self.robot_model = robot_model
@@ -107,3 +101,19 @@ class RobotEnv(gym.Env):
 
     def render(self, mode="human"):
         print(f"Robot at {self.robot_position}, Lights: {self.current_lights}")
+
+
+    def capture_env(self):
+        # Capture the current environment state
+        img = self.robot_model.camera_cap()
+        if img is not None:
+            return img
+        else:
+            print("Failed to capture image")
+            return None
+
+if __name__ == "__main__":
+    # test one 
+    obs, info = env.reset()
+    # test two 
+    obs, reward, terminated, truncated, info = env.step(action)
