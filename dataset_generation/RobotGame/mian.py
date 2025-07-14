@@ -1,3 +1,183 @@
+import os
+import sys
+import pickle
+import json
+import logging
+import torch
+import wandb
+from stable_baselines3 import PPO
+import zstandard as zstd
+from PIL import Image
+from stable_baselines3.common.callbacks import BaseCallback
+from typing import Any, List
+from pydantic import BaseModel
+import csv
+from huggingface_hub import HfApi
+
+class DataRecord(BaseModel):
+    episode: int
+    frames: List[Any]
+    actions: List[int]
+    batch_id: int
+    is_last_batch: bool
+
+
+class DataCollectorCallback(BaseCallback):
+    def __init__(self, save_path="./models", enable_rmq=True, save_locally=False, frames_to_skip=4, verbose=1):
+        super().__init__(verbose)
+        self.save_path = save_path
+        self.enable_rmq = enable_rmq
+        self.save_locally = save_locally
+        self.frames_to_skip = frames_to_skip
+
+        os.makedirs(save_path, exist_ok=True)
+        self.connection = None
+        self.channel = None
+        self.redis_client = None
+        self.episode_keys_buffer = []
+        self.frames_buffer = []
+        self.actions_buffer = []
+        self.states_buffer = [] 
+        self.max_batch_size = 500 * 1024 * 1024  # 500 MB
+        self.episode_count = 0
+        
+        self.api = HfApi(token=os.getenv("HF_TOKEN"))
+        
+    def _publish_keys_to_queue(self):
+        if self.enable_rmq:
+            message = json.dumps(self.episode_keys_buffer)
+            self.channel.basic_publish(exchange='', routing_key='HF_upload_queue', body=message)
+            logging.info(f"Published keys to RabbitMQ queue: {self.episode_keys_buffer}")
+            self.episode_keys_buffer.clear()
+
+
+    # def _save_data_to_redis(self, episode):
+    #     """Save current buffer to Redis with compression."""
+    #     logging.info("Saving data to Redis")
+    #     key = f"episode_{episode}"
+    #     data = {'episode': episode, 'frames': self.frames_buffer, 'actions': self.actions_buffer}
+    #     serialized_data = pickle.dumps(data)
+
+    #     cctx = zstd.ZstdCompressor()
+    #     compressed_data = cctx.compress(serialized_data)
+
+    #     logging.info(f"Original size: {sys.getsizeof(serialized_data)} bytes, Compressed size: {len(compressed_data)} bytes")
+
+    #     self.redis_client.set(key, compressed_data)
+    #     self.episode_keys_buffer.append(key)
+    #     self.clear_buffers()
+
+    #     if len(self.episode_keys_buffer) >= 20:
+    #         self._publish_keys_to_queue()
+
+    def _get_buffer_size(self):
+        """Estimate current buffer size in bytes."""
+        frame_size = sum(frame.nbytes for frame in self.frames_buffer)
+        action_size = sum(sys.getsizeof(action) for action in self.actions_buffer)
+        state_size = sum(state.nbytes for state in self.state_buffer)
+        return frame_size + action_size + state_size
+
+    def _save_frames_locally(self, episode):
+        """Save frames and associated data (action, state) as a table."""
+        episode_dir = f"episode_{episode}"
+        os.makedirs(episode_dir, exist_ok=True)
+
+        metadata_path = os.path.join(episode_dir, "metadata.csv")
+        with open(metadata_path, mode="w", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["frame_index", "filename", "action", "state"])  # header
+
+            for idx, (frame, action, state) in enumerate(zip(self.frames_buffer, self.actions_buffer, self.states_buffer)):
+                filename = f"{idx:05d}_action_{action}.png"
+                filepath = os.path.join(episode_dir, filename)
+
+                # Save image
+                Image.fromarray(frame).save(filepath)
+
+                # Write metadata row
+                writer.writerow([idx, filename, action, state])
+
+        
+        self.api.upload_folder(
+            folder_path=episode_dir,  # your local folder path
+            repo_id="Sing0402/robot-episodes",  # your dataset repo name
+            repo_type="dataset",
+        )
+        print("Upload done!")
+
+    def clear_buffers(self):
+        """Clear the in-memory frame and action buffers."""
+        self.frames_buffer.clear()
+        self.actions_buffer.clear()
+        self.state_buffer.clear()
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        actions = self.locals.get("actions", None)
+
+        for i, info in enumerate(infos):
+            frame = info.get("frame")
+            state = info.get('state')
+            action = actions[i] if actions is not None else None
+            done = info.get("done", False)
+
+            if frame is not None and action is not None:
+                self.frames_buffer.append(frame)
+                self.actions_buffer.append(action)
+                self.states_buffer.append(state)
+
+            # if self.enable_rmq:
+            #     buffer_size = self._get_buffer_size()
+            #     logging.info(f"Current buffer size: {buffer_size} bytes")
+                # if buffer_size >= self.max_batch_size:
+                #     logging.warning("Buffer exceeded 500MB, saving to Redis")
+                #     self._save_data_to_redis(episode_idx)
+
+            if done:
+                logging.info(f"Episode {self.episode_count} done, saving remaining buffer immediately.")
+                if self.save_locally:
+
+                    self._save_frames_locally(self.episode_count)
+                    self.episode_count += 1
+                # if self.enable_rmq:
+                #     self._save_data_to_redis(episode_idx)
+                self.clear_buffers()
+
+        return True
+
+
+class TrainLoggingCallback(BaseCallback):
+    def __init__(self, save_freq, save_path, verbose=1):
+        super().__init__(verbose)
+        self.save_freq = save_freq
+        self.save_path = save_path
+        os.makedirs(save_path, exist_ok=True)
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps % self.save_freq == 0:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logging.info(torch.cuda.memory_summary())
+
+            model_file = os.path.join(self.save_path, f"pacman_{self.num_timesteps}.zip")
+            self.model.save(model_file)
+            logging.info(f"Model saved at timestep {self.num_timesteps} to {model_file}")
+
+        return True
+
+
+class WandbCallback(BaseCallback):
+    def _on_step(self) -> bool:
+        infos = self.locals.get('infos', [])
+        for info in infos:
+            if 'episode' in info:
+                wandb.log({
+                    "reward": info['episode']['r'],
+                    "length": info['episode']['l'],
+                    "timesteps": self.num_timesteps
+                })
+        return True
+
 
 
 if __name__ == "__main__":
@@ -6,156 +186,62 @@ if __name__ == "__main__":
     import numpy as np
     import cv2
     from stable_baselines3 import SAC
-
+    from stable_baselines3.sac.policies import SACPolicy
+    from MultiCamFeatureExtractor import CustomFeatureExtractor
+    from game import Game
     import gymnasium as gym
+    import time
+    import os
+    import logging
 
-    env = RobotEnv(
-        robot_model=Robot(),
-        num_colors=3,  # Example: Red, Green, Blue
-        num_lights=5,  # Example: 5 lights
-        time_limit=10,  # Example: 10 seconds time limit
-        serial_port="/dev/ttyUSB0",  # Adjust as necessary
-        baud_rate=9600,
-        timeout=1,
+    wandb.init(
+        project="robot-sac-training",
+        entity="tedlosingyau-monash-university",
+        name="run_001",
+        config={
+            "algorithm": "SAC",
+            "total_timesteps": 100_000,
+            "features_dim": 256
+        },
+        sync_tensorboard=True,
+        monitor_gym=False,
+        save_code=True,
     )
-    env = gym.wrappers.RecordEpisodeStatistics(env, deque_size=1000)
+
+    env = gym.make("CartPole-v1", render_mode="rgb_array")
     
+    # game_model = Game(
+    #     url="ws://localhost:8080",  # Example URL, adjust as necessary 
+    #     sequence_length=4  # Example sequence length
+    # )
 
-    model = SAC("MlpPolicy", env, verbose=1)
-    model.learn(total_timesteps=10000, log_interval=4) # change this into a loop
+    # robot_model = Robot(
+    #     L1 = 6,
+    #     L2 = 7, 
+    #     L3 = 7, 
+    #     serial_port='COM3',
+    #     init_position=(0, 0 , 0), # not yet set
+    #     test_mode=False
+    # )
 
+    # robot_env = RobotEnv(
+    #     robot_model,
+    #     game_model,
+    #     num_colors =4 ,
+    #     num_lights =4,
+    #     time_limit = 60, # 1 minute
+    # )
 
-    model.save("RobotGame_SAC_Model")
+    policy_kwargs = dict(
+        features_extractor_class=CustomFeatureExtractor,
+        features_extractor_kwargs=dict(features_dim=256),
+    )
 
+    # data_collector_cb = DataCollectorCallback( save_path="./models", enable_rmq=False, save_locally=True)
+    # train_logger_cb = TrainLoggingCallback(save_freq=5000, save_path="./models")
+    # wandb_cb = WandbCallback()
 
+    model = SAC("MlpPolicy", env, policy_kwargs=policy_kwargs ,verbose=1)
+    model.learn(total_timesteps=100000)
 
-## sample code to do the pipeline of uploading dataset 
-# def train(self):
-#     if self.enable_rmq:
-#         self._setup_rabbitmq()
-
-#     screen = self.env.reset(mode='rgb_array')
-#     n_actions = self.env.action_space.n
-
-#     self.agent = PacmanAgent(screen.shape, n_actions)
-#     self.memory = ProportionalPrioritizedReplayBuffer(100000)  # Use the new prioritized replay buffer
-
-#     frames_buffer, actions_buffer = [], []
-#     max_batch_size = 500 * 1024 * 1024  # 400 MB
-
-#     for i_episode in range(self.episodes):
-#         state = self.env.reset(mode='rgb_array')
-#         ep_reward = 0.
-#         epsilon = self._get_epsilon(i_episode)
-#         logging.info("-----------------------------------------------------")
-#         logging.info(f"Starting episode {i_episode} with epsilon {epsilon}")
-
-#         for t in count():
-#             current_frame = self.env.render(mode='rgb_array')
-#             self.env.render(mode='human')
-
-#             action = self.agent.select_action(state, epsilon, n_actions)
-#             next_state, reward, done, _ = self.env.step(action)
-#             reward = max(-1.0, min(reward, 1.0))
-#             ep_reward += reward
-            
-#             if self.enable_rmq or self.save_locally:
-#                 frames_buffer.append(current_frame)
-#                 actions_buffer.append(self.action_encoder(action))
-
-#             self.memory.cache(state, next_state, action, reward, done)
-
-#             state = next_state if not done else None
-
-#             self.agent.optimize_model(self.memory, n_steps=3)
-#             if done:
-#                 pellets_left = self.env.maze.get_number_of_pellets()
-#                 if self.save_locally:
-#                     self._save_frames_locally(frames=frames_buffer, episode=i_episode, actions=actions_buffer)
-#                 logging.info(f"Episode #{i_episode} finished after {t + 1} timesteps with total reward: {ep_reward} and {pellets_left} pellets left.")
-                
-#                 # Log the reward to wandb
-#                 wandb.log({"episode": i_episode, "reward": ep_reward, "pellets_left": pellets_left})
-                
-#                 break
-
-#             # Check if the batch size limit is reached
-#         if self.enable_rmq:
-#             buffer_size = self._get_buffer_size(frames_buffer, actions_buffer)
-#             logging.info(f"Buffer size: {buffer_size} bytes")
-#             if buffer_size >= max_batch_size:
-#                 logging.warning("BUFFER SIZE EXCEEDING 500MB")
-#             self._save_data_to_redis(i_episode, frames_buffer, actions_buffer)
-#             frames_buffer, actions_buffer = [], []
-#             # batch_id += 1
-
-#         # Send remaining data at the end of the episode
-#         if frames_buffer and self.enable_rmq:
-#             self._save_data_to_redis(i_episode, frames_buffer, actions_buffer)
-#             frames_buffer, actions_buffer = [], []
-
-#         if i_episode > 2: 
-#             if i_episode % 10 == 0:
-#                 if torch.cuda.is_available():
-#                     torch.cuda.empty_cache()
-#                     logging.info(torch.cuda.memory_summary())
-#                 torch.autograd.set_detect_anomaly(True)
-
-#             if i_episode % 1000 == 0:
-#                 self.agent.save_model('pacman.pth')
-#                 logging.info(f"Saved model at episode {i_episode}")
-
-#     logging.info('Training Complete')
-#     self.env.close()
-#     self.agent.save_model('pacman.pth')
-#     if self.enable_rmq:
-#         self._close_rabbitmq()
-
-# def _get_buffer_size(self, frames_buffer, actions_buffer):
-#     # Estimate the size of the buffers in bytes
-#     buffer_size = sum([frame.nbytes for frame in frames_buffer]) + \
-#                     sum([sys.getsizeof(action) for action in actions_buffer])
-#     return buffer_size
-
-# def _get_epsilon(self, frame_idx):
-#     # Start with a lower initial epsilon and decay faster
-#     initial_epsilon = 0.8  # Lower initial exploration rate
-#     min_epsilon = 0.05      # Minimum exploration rate
-#     decay_rate = 5e2       # Faster decay rate
-
-#     return min_epsilon + (initial_epsilon - min_epsilon) * math.exp(-1. * frame_idx / decay_rate)
-
-# def _save_data(self, data_record: DataRecord):
-#     self.save_queue.put(data_record)
-#     if self.enable_rmq:
-#         self._publish_to_rabbitmq(self.save_queue.get())
-
-# def _save_remaining_data(self, data_record: DataRecord):
-#     if data_record.frames:
-#         self._save_data(data_record)
-
-# def _publish_to_rabbitmq(self, data: DataRecord):
-#     import pickle
-
-#     # Serialize the data using pickle
-#     message = pickle.dumps(data.dict())
-
-#     # Publish the message to the queue
-#     self.channel.basic_publish(exchange='',
-#                                 routing_key='HF_upload_queue',
-#                                 body=message)
-
-#     logging.info("Published dataset to RabbitMQ queue 'HF_upload_queue'")
-
-# def _save_frames_locally(self, frames, episode, actions):
-#     # Create a directory for the episode if it doesn't exist
-#     episode_dir = f"episode_{episode}_frs{self.frames_to_skip}"
-#     if not os.path.exists(episode_dir):
-#         os.makedirs(episode_dir)
-
-#     # Save each frame as a PNG file with the episode and action in the filename
-#     for idx, frame in enumerate(frames):
-#         action = actions[idx]
-#         filename = os.path.join(episode_dir, f"{idx:05d}.png")
-#         Image.fromarray(frame).save(filename)
-#         # logging.info(f"Saved frame {idx} of episode {episode} with action {action} to {filename}")
+  
