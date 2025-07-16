@@ -69,12 +69,6 @@ class Game:
                 if len(self.player_sequence) == self.num_sequences:
                         return self.num_sequences , True
             
-                # Reward based on how close robot is to the target button
-                dist = np.linalg.norm(np.array(robot_pos) - np.array(self.target_position[self.sequence[len(self.player_sequence)] -  1]))
-                max_dist = 0.5  # max meaningful distance, tune this
-                proximity_reward = max(0, (max_dist - dist) / max_dist)  # normalized between 0 and 1
-                proximity_reward = min(proximity_reward, 0.7)  # cap at 0.7
-                reward += proximity_reward
                 
                 return len(self.player_sequence) , False
             else:
